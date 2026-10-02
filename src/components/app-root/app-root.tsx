@@ -1,4 +1,4 @@
-import { Component, Host, State, h, Listen } from '@stencil/core';
+import { Component, Host, State, h, Fragment, Listen } from '@stencil/core';
 import {
   cloneProject,
   createDemoProject,
@@ -15,8 +15,24 @@ import {
   type LessonStep,
   type ValidationCheck,
 } from '../../models';
+import {
+  applyReconcile,
+  confirmReview,
+  contentHash,
+  createReviewDraft,
+  loadReviewDraft,
+  reconcile,
+  saveReviewDraft,
+  upsertReview,
+  type MergeItem,
+  type ReconcileOutcome,
+  type ReviewDraft,
+  type ReviewVerdict,
+} from '../../review-store';
 
 type PreviewSize = 'phone' | 'tablet';
+type WorkMode = 'orchestration' | 'review';
+type MergeFaultSide = 'orchestration' | 'review';
 
 @Component({
   tag: 'app-root',
@@ -25,12 +41,19 @@ type PreviewSize = 'phone' | 'tablet';
 })
 export class AppRoot {
   @State() project: CourseProject = createDemoProject();
+  @State() review: ReviewDraft = createReviewDraft('sign-course-project');
+  @State() mode: WorkMode = 'orchestration';
   @State() previewSize: PreviewSize = 'phone';
   @State() activePanel: 'editor' | 'checks' = 'editor';
   @State() playing = false;
   @State() playProgress = 0;
   @State() offline = typeof navigator !== 'undefined' ? !navigator.onLine : false;
   @State() toast?: { color: string; message: string };
+  @State() showReconcile = false;
+  @State() reconcileItems: MergeItem[] = [];
+  @State() reconcileFailedSide?: MergeFaultSide;
+  @State() reconcileSyncedAt?: string;
+  @State() mergeFaults: Record<MergeFaultSide, boolean> = { orchestration: false, review: false };
   private past: CourseProject[] = [];
   private future: CourseProject[] = [];
   private playTimer?: number;
@@ -42,6 +65,8 @@ export class AppRoot {
     } catch {
       this.project = createDemoProject();
     }
+    // 复核端草稿独立加载，与编排端草稿互不影响
+    this.review = loadReviewDraft(this.project.id);
   }
 
   disconnectedCallback(): void {
@@ -51,13 +76,14 @@ export class AppRoot {
   @Listen('online', { target: 'window' })
   handleOnline(): void {
     this.offline = false;
-    this.showToast('success', '网络已恢复，本地草稿无需合并即可继续编辑。');
+    this.showToast('success', '网络已恢复，正在按步骤编号与复核端对账合并。');
+    this.runReconcile();
   }
 
   @Listen('offline', { target: 'window' })
   handleOffline(): void {
     this.offline = true;
-    this.showToast('warning', '当前处于离线状态，修改会继续保存在本机。');
+    this.showToast('warning', '当前处于离线状态：编排草稿与复核意见仍各自保存在本机，恢复后自动对账。');
   }
 
   @Listen('keydown', { target: 'window' })
@@ -99,6 +125,127 @@ export class AppRoot {
 
   private persist(): void {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(this.project));
+  }
+
+  private persistReview(): void {
+    saveReviewDraft(this.review);
+  }
+
+  private get currentReview() {
+    const stepId = this.currentStep?.id;
+    return stepId ? this.review.reviews[stepId] : undefined;
+  }
+
+  /** 某步骤在复核端的实时状态：已确认 / 待确认 / 待重新确认 / 未复核。 */
+  private reviewStateFor(stepId: string): 'confirmed' | 'pending' | 'stale' | 'none' {
+    const review = this.review.reviews[stepId];
+    if (!review) return 'none';
+    const hash = contentHashFor(this.project, stepId);
+    if (hash !== null && hash !== review.baseHash) return 'stale';
+    return review.confirmed ? 'confirmed' : 'pending';
+  }
+
+  private get pendingReviewCount(): number {
+    return Object.values(this.review.reviews).filter((review) => {
+      const hash = contentHashFor(this.project, review.stepId);
+      return !review.confirmed || (hash !== null && hash !== review.baseHash);
+    }).length;
+  }
+
+  private setReviewVerdict(verdict: ReviewVerdict): void {
+    const stepId = this.currentStep?.id;
+    if (!stepId) return;
+    this.review = upsertReview(this.review, this.project, stepId, { verdict });
+    this.persistReview();
+  }
+
+  private setReviewOpinion(opinion: string): void {
+    const stepId = this.currentStep?.id;
+    if (!stepId) return;
+    this.review = upsertReview(this.review, this.project, stepId, { opinion });
+    this.persistReview();
+  }
+
+  private setReviewer(reviewer: string): void {
+    this.review = { ...this.review, reviewer };
+    this.persistReview();
+  }
+
+  private confirmCurrentReview(): void {
+    const stepId = this.currentStep?.id;
+    if (!stepId || !this.review.reviews[stepId]) {
+      this.showToast('medium', '请先为该步骤选择复核结论。');
+      return;
+    }
+    this.review = confirmReview(this.review, this.project, stepId);
+    this.persistReview();
+    this.showToast('success', '复核结论已确认，基准对齐当前编排内容。');
+  }
+
+  private openReconcile(): void {
+    this.runReconcile();
+    this.showReconcile = true;
+  }
+
+  private runReconcile(): void {
+    const outcome: ReconcileOutcome = reconcile(this.project, this.review, this.mergeFaults);
+    if (outcome.ok) {
+      this.review = applyReconcile(this.review, outcome);
+      this.reconcileItems = outcome.items;
+      this.reconcileFailedSide = undefined;
+      this.reconcileSyncedAt = outcome.syncedAt;
+      this.persistReview();
+      const stale = outcome.items.filter((item) => item.status === 'stale').length;
+      const conflicts = outcome.items.filter((item) => item.status === 'conflict').length;
+      if (conflicts > 0) {
+        this.showToast('warning', `对账完成：${conflicts} 条步骤两边都动过，已并排放置，请逐条确认。`);
+      } else if (stale > 0) {
+        this.showToast('warning', `对账完成：${stale} 条步骤被编排端改动，结论已退回未确认并保留在列表中。`);
+      } else {
+        this.showToast('success', '对账完成，编排端与复核端已按步骤编号合并。');
+      }
+    } else {
+      this.reconcileItems = [];
+      this.reconcileFailedSide = outcome.failedSide;
+      this.showToast('danger', `${outcome.failedSide === 'orchestration' ? '编排端' : '复核端'}合并失败，已确认的结论已保留，可按侧重试。`);
+    }
+  }
+
+  private retryMerge(side: MergeFaultSide): void {
+    this.mergeFaults = { ...this.mergeFaults, [side]: false };
+    this.showToast('medium', `正在重试${side === 'orchestration' ? '编排端' : '复核端'}合并，已确认结论不会回滚。`);
+    window.setTimeout(() => this.runReconcile(), 350);
+  }
+
+  private toggleMergeFault(side: MergeFaultSide): void {
+    this.mergeFaults = { ...this.mergeFaults, [side]: !this.mergeFaults[side] };
+  }
+
+  private confirmMergeItem(stepId: string): void {
+    if (!this.review.reviews[stepId]) return;
+    this.review = confirmReview(this.review, this.project, stepId);
+    this.persistReview();
+    this.reconcileItems = this.reconcileItems.map((item) =>
+      item.stepId === stepId
+        ? { ...item, status: 'ok', contentChanged: false, bothModified: false }
+        : item,
+    );
+    this.showToast('success', '已确认合并：内容认编排端，结论认复核端。');
+  }
+
+  private confirmAllMergeItems(): void {
+    let draft = this.review;
+    for (const item of this.reconcileItems) {
+      if (item.review && item.status !== 'ok' && item.status !== 'orphaned') {
+        draft = confirmReview(draft, this.project, item.stepId);
+      }
+    }
+    this.review = draft;
+    this.persistReview();
+    this.reconcileItems = this.reconcileItems.map((item) =>
+      item.status === 'orphaned' ? item : { ...item, status: 'ok', contentChanged: false, bothModified: false },
+    );
+    this.showToast('success', '可合并的结论已全部逐条确认。');
   }
 
   private commit(update: (draft: CourseProject) => CourseProject, toast?: string): void {
@@ -339,9 +486,15 @@ export class AppRoot {
     return <ion-badge color="medium">草稿</ion-badge>;
   }
 
+  private reviewedCount(module: CourseModule): number {
+    return module.steps.filter((step) => this.review.reviews[step.id]).length;
+  }
+
   private renderStepListItem(step: LessonStep, index: number) {
     const active = step.id === this.currentStep?.id;
     const issueCount = this.checks.filter((check) => check.stepId === step.id && check.severity !== 'info').length;
+    const reviewState = this.mode === 'review' ? this.reviewStateFor(step.id) : 'none';
+    const review = this.mode === 'review' ? this.review.reviews[step.id] : undefined;
     return (
       <button class={`step-list-item ${active ? 'active' : ''}`} onClick={() => this.selectStep(step.id)}>
         <span class="step-index">{String(index + 1).padStart(2, '0')}</span>
@@ -349,7 +502,11 @@ export class AppRoot {
           <strong>{step.title}</strong>
           <small>{step.kind} · {step.duration}s · {step.difficulty}</small>
         </span>
-        {issueCount > 0 && <span class="step-issue-count">{issueCount}</span>}
+        {this.mode === 'review' ? (
+          <span class={`step-review-state ${reviewState}`}>
+            {reviewState === 'confirmed' ? (review?.verdict === 'pass' ? '✓ 通过' : '↩ 退回') : reviewState === 'stale' ? '待重新确认' : reviewState === 'pending' ? '待确认' : '未复核'}
+          </span>
+        ) : issueCount > 0 ? <span class="step-issue-count">{issueCount}</span> : null}
       </button>
     );
   }
@@ -540,6 +697,218 @@ export class AppRoot {
     );
   }
 
+  /** 复核端：每个步骤的结论与退回意见，独立于编排端内容。 */
+  private renderReviewPanel() {
+    const step = this.currentStep;
+    const review = this.currentReview;
+    const index = this.currentModule?.steps.findIndex((item) => item.id === step?.id) ?? -1;
+    const contentChanged = step ? contentHashFor(this.project, step.id) !== (review?.baseHash ?? '') : false;
+    return (
+      <section class="review-panel">
+        <div class="review-head">
+          <div>
+            <span class="eyebrow">复核端</span>
+            <h2>步骤复核结论</h2>
+            <p>结论与退回意见独立保存在复核端草稿，与编排端课程内容分开存储；断网也能记录。</p>
+          </div>
+          <ion-button class="studio-button reconcile-trigger" onClick={() => this.openReconcile()}>
+            对账中心
+            {this.pendingReviewCount > 0 && <span class="reconcile-badge">{this.pendingReviewCount}</span>}
+          </ion-button>
+        </div>
+
+        {step ? (
+          <div class="review-form">
+            <div class="review-step-info">
+              <strong>{step.title}</strong>
+              <span>{this.currentModule?.title} · 步骤 {index + 1} · 编号 {step.id}</span>
+            </div>
+
+            {contentChanged && review?.confirmed && (
+              <div class="review-stale-callout">
+                <strong>编排端已修改此步骤内容</strong>
+                <span>结论已退回未确认，但仍保留在列表中，重新核对后可再次确认。</span>
+              </div>
+            )}
+            {contentChanged && review && !review.confirmed && (
+              <div class="review-stale-callout info">
+                <strong>此步骤内容已更新</strong>
+                <span>结论仍保留，请核对编排端内容后确认。</span>
+              </div>
+            )}
+
+            <div class="review-field">
+              <span class="field-label">复核结论</span>
+              <div class="verdict-group">
+                <button class={`verdict-btn pass ${review?.verdict === 'pass' ? 'active' : ''}`} onClick={() => this.setReviewVerdict('pass')}>✓ 通过</button>
+                <button class={`verdict-btn return ${review?.verdict === 'return' ? 'active' : ''}`} onClick={() => this.setReviewVerdict('return')}>↩ 退回</button>
+              </div>
+            </div>
+
+            <div class="review-field">
+              <span class="field-label">复核意见 / 退回意见</span>
+              <ion-textarea
+                autoGrow
+                class="studio-input"
+                placeholder={review?.verdict === 'return' ? '填写需要退回修改的具体问题……' : '填写复核说明（可空）……'}
+                value={review?.opinion ?? ''}
+                onIonInput={(event) => this.setReviewOpinion(event.detail.value ?? '')}
+              />
+            </div>
+
+            <div class="review-field">
+              <span class="field-label">复核人</span>
+              <ion-input class="studio-input" placeholder="复核人姓名" value={this.review.reviewer} onIonInput={(event) => this.setReviewer(event.detail.value ?? '')} />
+            </div>
+
+            <div class="review-confirm-row">
+              <div class="review-status">
+                {review?.confirmed
+                  ? <span class="status-pill confirmed">已确认{review.confirmedAt ? ` · ${this.formatDate(review.confirmedAt)}` : ''}</span>
+                  : <span class="status-pill pending">{contentChanged ? '待重新确认' : '未确认'}</span>}
+                {review && <span class="review-meta">结论基准 修订号 r{review.baseRevision}</span>}
+              </div>
+              <ion-button class="studio-button" onClick={() => this.confirmCurrentReview()} disabled={!review}>确认本条结论</ion-button>
+            </div>
+
+            <div class="review-merge-hint">
+              <strong>对账规则</strong>
+              <p>网络恢复后按步骤编号对账：同一步骤两边都动过时，内容认编排端、结论认复核端，两版并排放置逐条确认；合并失败可按侧重试，已确认的结论先保住。</p>
+            </div>
+          </div>
+        ) : (
+          <div class="empty-editor">
+            <div class="empty-glyph">核</div>
+            <h2>选择步骤开始复核</h2>
+            <p>在左侧步骤列表中选择一个学习步骤，记录通过或退回结论。</p>
+          </div>
+        )}
+      </section>
+    );
+  }
+
+  private renderMergeItem(item: MergeItem) {
+    const statusMeta: Record<MergeItem['status'], { label: string; cls: string }> = {
+      ok: { label: '已确认', cls: 'ok' },
+      pending: { label: '待复核', cls: 'pending' },
+      stale: { label: '内容已更新 · 待重新确认', cls: 'stale' },
+      conflict: { label: '两边都动过 · 待逐条确认', cls: 'conflict' },
+      orphaned: { label: '步骤已删除 · 结论保留', cls: 'orphaned' },
+    };
+    const meta = statusMeta[item.status];
+    return (
+      <div class={`merge-item status-${meta.cls}`} key={item.stepId}>
+        <div class="merge-item-head">
+          <div class="merge-item-title">
+            <strong>{item.stepTitle}</strong>
+            <span>{item.moduleTitle ? `${item.moduleTitle} · ` : ''}编号 {item.stepId}</span>
+          </div>
+          <span class={`merge-status ${meta.cls}`}>{meta.label}</span>
+        </div>
+
+        {item.status === 'conflict' && item.currentStep && item.review && (
+          <div class="merge-diff">
+            <div class="diff-side orchestration">
+              <h4>编排端版本 · 内容</h4>
+              <dl>
+                <div><dt>标题</dt><dd>{item.currentStep.title}</dd></div>
+                <div><dt>类型 / 时长</dt><dd>{item.currentStep.kind} · {item.currentStep.duration}s</dd></div>
+                <div><dt>字幕</dt><dd>{item.currentStep.caption || '（未填写）'}</dd></div>
+                <div><dt>手形</dt><dd>{item.currentStep.handshape}</dd></div>
+                <div><dt>镜头 / 区域</dt><dd>{item.currentStep.camera} · {item.currentStep.gestureZone}</dd></div>
+              </dl>
+            </div>
+            <div class="diff-side review">
+              <h4>复核端版本 · 结论</h4>
+              <dl>
+                <div><dt>结论</dt><dd>{item.review.verdict === 'pass' ? '✓ 通过' : '↩ 退回'}</dd></div>
+                <div><dt>意见</dt><dd>{item.review.opinion || '（无）'}</dd></div>
+                <div><dt>复核人</dt><dd>{item.review.reviewer || '（未填写）'}</dd></div>
+                <div><dt>结论时间</dt><dd>{this.formatDate(item.review.updatedAt)}</dd></div>
+              </dl>
+            </div>
+          </div>
+        )}
+
+        {item.status !== 'conflict' && item.review && (
+          <div class="merge-summary">
+            <span class={`verdict-pill ${item.review.verdict}`}>{item.review.verdict === 'pass' ? '✓ 通过' : '↩ 退回'}</span>
+            <span class="merge-opinion">{item.review.opinion || '（无退回意见）'}</span>
+            <span class="merge-reviewer">{item.review.reviewer || '未署名'} · {this.formatDate(item.review.updatedAt)}</span>
+          </div>
+        )}
+
+        {item.status === 'orphaned' && (
+          <div class="merge-orphan-note">编排端已删除该步骤，复核结论仍保留在列表中，不会被合并清除。</div>
+        )}
+
+        <div class="merge-actions">
+          {item.status === 'conflict' && (
+            <ion-button size="small" class="studio-button" onClick={() => this.confirmMergeItem(item.stepId)}>确认合并（内容认编排端 · 结论认复核端）</ion-button>
+          )}
+          {item.status === 'stale' && (
+            <ion-button size="small" class="studio-button" onClick={() => this.confirmMergeItem(item.stepId)}>重新确认结论</ion-button>
+          )}
+          {item.status === 'pending' && item.review && (
+            <ion-button size="small" class="studio-button" onClick={() => this.confirmMergeItem(item.stepId)}>确认本条结论</ion-button>
+          )}
+          {item.status === 'ok' && <span class="merge-done">✓ 已确认</span>}
+        </div>
+      </div>
+    );
+  }
+
+  private renderReconcileModal() {
+    if (!this.showReconcile) return null;
+    return (
+      <div class="reconcile-overlay" onClick={() => { this.showReconcile = false; }}>
+        <div class="reconcile-modal" onClick={(event) => event.stopPropagation()}>
+          <div class="reconcile-head">
+            <div>
+              <span class="eyebrow">对账中心</span>
+              <h2>按步骤编号对账合并</h2>
+              <p>网络恢复后自动合并；同一步骤两边都动过时，内容认编排端、结论认复核端，两版并排逐条确认。</p>
+            </div>
+            <button class="reconcile-close" onClick={() => { this.showReconcile = false; }}>×</button>
+          </div>
+
+          <div class="reconcile-toolbar">
+            <div class="fault-toggles">
+              <span>模拟合并失败：</span>
+              <button class={`fault-btn ${this.mergeFaults.orchestration ? 'active' : ''}`} onClick={() => this.toggleMergeFault('orchestration')}>编排端</button>
+              <button class={`fault-btn ${this.mergeFaults.review ? 'active' : ''}`} onClick={() => this.toggleMergeFault('review')}>复核端</button>
+            </div>
+            <ion-button size="small" fill="outline" class="studio-button" onClick={() => this.runReconcile()}>重新对账</ion-button>
+          </div>
+
+          {this.reconcileFailedSide ? (
+            <div class="reconcile-failed">
+              <div class="failed-glyph">!</div>
+              <h3>{this.reconcileFailedSide === 'orchestration' ? '编排端' : '复核端'}合并失败</h3>
+              <p>已确认的结论已保留，不会回滚或删除。可按侧重试。</p>
+              <div class="failed-actions">
+                <ion-button class="studio-button" onClick={() => this.retryMerge(this.reconcileFailedSide!)}>
+                  重试{this.reconcileFailedSide === 'orchestration' ? '编排端' : '复核端'}合并
+                </ion-button>
+                <ion-button fill="clear" class="studio-button" onClick={() => { this.showReconcile = false; }}>稍后处理</ion-button>
+              </div>
+            </div>
+          ) : (
+            <div class="reconcile-items">
+              {this.reconcileItems.length === 0 && <div class="reconcile-empty">暂无可合并的步骤。</div>}
+              {this.reconcileItems.map((item) => this.renderMergeItem(item))}
+            </div>
+          )}
+
+          <div class="reconcile-footer">
+            <span>上次对账：{this.reconcileSyncedAt ? this.formatDate(this.reconcileSyncedAt) : '尚未对账'}</span>
+            <ion-button size="small" class="studio-button" disabled={this.reconcileItems.every((item) => item.status === 'ok' || item.status === 'orphaned')} onClick={() => this.confirmAllMergeItems()}>全部逐条确认</ion-button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   render() {
     const module = this.currentModule;
     const errors = this.checks.filter((check) => check.severity === 'error').length;
@@ -579,46 +948,77 @@ export class AppRoot {
                 <div class={errors ? 'has-errors' : ''}><strong>{errors}</strong><span>阻断问题</span></div>
               </div>
               <div class="workflow-actions">
-                {this.project.status === 'review' && <ion-button fill="clear" color="danger" class="studio-button" onClick={() => this.returnForChanges()}>退回修改</ion-button>}
-                {this.project.status === 'draft' && <ion-button fill="clear" class="studio-button" onClick={() => this.addModule()}>＋ 新建模块</ion-button>}
-                <ion-button fill="clear" class="studio-button" onClick={() => this.addStep('练习')}>＋ 练习步骤</ion-button>
+                <div class="mode-switcher">
+                  <button class={this.mode === 'orchestration' ? 'active' : ''} onClick={() => { this.mode = 'orchestration'; }}>编排端</button>
+                  <button class={this.mode === 'review' ? 'active' : ''} onClick={() => { this.mode = 'review'; }}>
+                    复核端
+                    {this.pendingReviewCount > 0 && <span class="mode-dot">{this.pendingReviewCount}</span>}
+                  </button>
+                </div>
+                {this.mode === 'orchestration' ? (
+                  <Fragment>
+                    {this.project.status === 'review' && <ion-button fill="clear" color="danger" class="studio-button" onClick={() => this.returnForChanges()}>退回修改</ion-button>}
+                    {this.project.status === 'draft' && <ion-button fill="clear" class="studio-button" onClick={() => this.addModule()}>＋ 新建模块</ion-button>}
+                    <ion-button fill="clear" class="studio-button" onClick={() => this.addStep('练习')}>＋ 练习步骤</ion-button>
+                  </Fragment>
+                ) : (
+                  <ion-button fill="clear" class="studio-button" onClick={() => this.openReconcile()}>对账中心</ion-button>
+                )}
               </div>
             </div>
 
             <main class="studio-workspace">
               <aside class="course-panel">
-                <div class="panel-heading"><div><span class="eyebrow">课程结构</span><h2>模块与步骤</h2></div><button class="add-step-button" onClick={() => this.addStep('示范')}>＋</button></div>
+                <div class="panel-heading"><div><span class="eyebrow">{this.mode === 'review' ? '复核结构' : '课程结构'}</span><h2>{this.mode === 'review' ? '步骤与结论' : '模块与步骤'}</h2></div>{this.mode === 'orchestration' && <button class="add-step-button" onClick={() => this.addStep('示范')}>＋</button>}</div>
                 <div class="module-list">
                   {this.project.modules.map((item) => (
                     <section class={`module-card ${item.id === module?.id ? 'active' : ''}`} key={item.id}>
                       <button class="module-head" onClick={() => this.selectModule(item.id)}>
                         <span class="module-color" style={{ background: item.color }} />
-                        <span><strong>{item.title}</strong><small>{item.steps.length} 个学习步骤</small></span>
+                        <span><strong>{item.title}</strong><small>{item.steps.length} 个学习步骤{this.mode === 'review' ? ` · ${this.reviewedCount(item)} 条结论` : ''}</small></span>
                       </button>
                       {item.id === module?.id && <div class="step-list">{item.steps.map((lesson, index) => this.renderStepListItem(lesson, index))}</div>}
                     </section>
                   ))}
                 </div>
-                <div class="module-editor">
-                  <ion-input disabled={this.project.status === 'frozen'} label="当前模块标题" labelPlacement="stacked" class="studio-input" value={module?.title ?? ''} onIonInput={(event) => this.updateCurrentModule({ title: event.detail.value ?? '' })} />
-                  <ion-textarea disabled={this.project.status === 'frozen'} autoGrow label="模块目标" labelPlacement="stacked" class="studio-input" value={module?.summary ?? ''} onIonInput={(event) => this.updateCurrentModule({ summary: event.detail.value ?? '' })} />
-                </div>
+                {this.mode === 'orchestration' && (
+                  <div class="module-editor">
+                    <ion-input disabled={this.project.status === 'frozen'} label="当前模块标题" labelPlacement="stacked" class="studio-input" value={module?.title ?? ''} onIonInput={(event) => this.updateCurrentModule({ title: event.detail.value ?? '' })} />
+                    <ion-textarea disabled={this.project.status === 'frozen'} autoGrow label="模块目标" labelPlacement="stacked" class="studio-input" value={module?.summary ?? ''} onIonInput={(event) => this.updateCurrentModule({ summary: event.detail.value ?? '' })} />
+                  </div>
+                )}
               </aside>
 
               <section class="editor-panel">
-                <div class="panel-switcher">
-                  <button class={this.activePanel === 'editor' ? 'active' : ''} onClick={() => { this.activePanel = 'editor'; }}>步骤编排</button>
-                  <button class={this.activePanel === 'checks' ? 'active' : ''} onClick={() => { this.activePanel = 'checks'; }}>发布前检查 <span>{this.checks.length}</span></button>
-                </div>
-                <div class="editor-scroll">{this.activePanel === 'editor' ? this.renderStepEditor() : this.renderChecks()}</div>
+                {this.mode === 'orchestration' ? (
+                  <>
+                    <div class="panel-switcher">
+                      <button class={this.activePanel === 'editor' ? 'active' : ''} onClick={() => { this.activePanel = 'editor'; }}>步骤编排</button>
+                      <button class={this.activePanel === 'checks' ? 'active' : ''} onClick={() => { this.activePanel = 'checks'; }}>发布前检查 <span>{this.checks.length}</span></button>
+                    </div>
+                    <div class="editor-scroll">{this.activePanel === 'editor' ? this.renderStepEditor() : this.renderChecks()}</div>
+                  </>
+                ) : (
+                  <div class="editor-scroll review-scroll">{this.renderReviewPanel()}</div>
+                )}
               </section>
 
               {this.renderPreview()}
             </main>
           </ion-content>
+          {this.renderReconcileModal()}
           <ion-toast isOpen={Boolean(this.toast)} message={this.toast?.message} color={this.toast?.color} duration={3200} onDidDismiss={() => { this.toast = undefined; }} />
         </ion-app>
       </Host>
     );
   }
+}
+
+/** 取某步骤当前编排端内容的哈希；步骤不存在时返回 null。 */
+function contentHashFor(project: CourseProject, stepId: string): string | null {
+  for (const module of project.modules) {
+    const step = module.steps.find((item) => item.id === stepId);
+    if (step) return contentHash(step);
+  }
+  return null;
 }
